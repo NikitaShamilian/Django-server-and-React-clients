@@ -1,8 +1,8 @@
 from django.urls import path
-from .views import MessageCreateView, AuditLogListView, RegisterView
+from .views import RegisterView, SaveKeyView, AuditLogListView
 
 urlpatterns = [
-    path("register/", RegisterView.as_view(), name="register"),
-    path("send/", MessageCreateView.as_view(), name="send_message"),
-    path("audit/", AuditLogListView.as_view(), name="audit_log"),
+    path("register/", RegisterView.as_view()),
+    path("save_key/", SaveKeyView.as_view()),
+    path("audit_logs/", AuditLogListView.as_view()),
 ]

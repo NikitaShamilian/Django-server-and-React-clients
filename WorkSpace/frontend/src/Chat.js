@@ -1,107 +1,227 @@
-import React, { useState, useEffect } from "react";
-import { generateKeyPair, signMessage } from "./crypto";
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import {
+  signMessage,
+  generateDHKeys,
+  computeShared,
+  encryptMessage,
+} from "./crypto";
 
-const Chat = ({ username, token }) => {
-  const [socket, setSocket] = useState(null);
+let socket = null;
+let sharedSecret = null;
+
+export default function Chat({ token, username }) {
   const [receiver, setReceiver] = useState("");
   const [message, setMessage] = useState("");
-  const [chat, setChat] = useState([]);
-  const [keys, setKeys] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [connected, setConnected] = useState(false);
+  const chatRef = useRef(null);
 
-  // генерируем ключи при первом заходе
   useEffect(() => {
-    (async () => {
-      const { publicKey, privateKey } = await generateKeyPair();
-      setKeys({ publicKey, privateKey });
-    })();
-  }, []);
+    chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight });
+  }, [messages]);
 
-  // подключение WebSocket
-  useEffect(() => {
-    if (!keys || !token) return;
+  const connectWS = useCallback(() => {
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING))
+      return;
+    if (!token) return;
 
-    // 🔧 исправлено: без /${username}/
-    const ws = new WebSocket(
-      `ws://127.0.0.1:8000/ws/chat/?token=${token}`
-    );
+    console.log("[WS] 🔄 connecting...");
+    socket = new WebSocket(`ws://127.0.0.1:8000/ws/chat/?token=${token}`);
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      setChat((prev) => [...prev, data]);
-    };
-
-    ws.onclose = () => {
-      console.log("WebSocket closed");
-    };
-
-    setSocket(ws);
-    return () => ws.close();
-  }, [keys, token]);
-
-  // отправка сообщения
-  const sendMessage = async () => {
-    if (socket && receiver && message && keys) {
-      const signature = await signMessage(keys.privateKey, message);
-
-      const payload = {
-        receiver,
-        content: message,
-        signature,
-        sender: username,
-      };
-
-      // отправляем по WebSocket
-      socket.send(JSON.stringify(payload));
-
-      // отправляем на API для логирования/хранения
+    socket.onopen = async () => {
+      console.log("[WS] ✅ connected");
+      setConnected(true);
       try {
-        await fetch("http://127.0.0.1:8000/api/send/", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            receiver,
-            content: message,
-            signature,
-          }),
+        const keys = await generateDHKeys();
+        const secret = await computeShared(keys.private, keys.public);
+        sharedSecret = secret;
+      } catch (e) {
+        console.error("[DH init]", e);
+      }
+    };
+
+    socket.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (!data.content) return;
+        setMessages((prev) => {
+          const dup = prev.find(
+            (m) => m.from === data.sender && m.text === data.content
+          );
+          return dup ? prev : [...prev, { from: data.sender, text: data.content }];
         });
       } catch (err) {
-        console.error("API send error", err);
+        console.error("[WS onmessage]", err);
       }
+    };
 
+    socket.onclose = () => {
+      console.warn("[WS] 🔌 closed");
+      setConnected(false);
+      sharedSecret = null;
+      socket = null;
+      setTimeout(connectWS, 2000); // мягкий реконнект
+    };
+
+    socket.onerror = () => {
+      console.error("[WS] error");
+      socket.close();
+    };
+  }, [token]);
+
+  useEffect(() => {
+    connectWS();
+    return () => {
+      if (socket) socket.close();
+    };
+  }, [connectWS]);
+
+  const sendMessage = async () => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      alert("WebSocket not connected");
+      return;
+    }
+    if (!receiver || !message) return;
+
+    try {
+      if (sharedSecret) {
+        const sig = await signMessage(message);
+        const enc = await encryptMessage(sharedSecret, message);
+        const sharedBase64 = btoa(String.fromCharCode(...sharedSecret));
+
+        socket.send(
+          JSON.stringify({
+            type: "encrypted-message",
+            receiver,
+            signature: sig,
+            shared_secret: sharedBase64,
+            nonce: enc.nonce,
+            ciphertext: enc.ciphertext,
+            tag: enc.tag,
+          })
+        );
+      } else {
+        socket.send(
+          JSON.stringify({
+            type: "plaintext-message",
+            receiver,
+            content: message,
+          })
+        );
+      }
+      setMessages((p) => [...p, { from: username, text: message }]);
       setMessage("");
+    } catch (err) {
+      console.error("[sendMessage]", err);
     }
   };
 
   return (
-    <div style={{ border: "1px solid gray", padding: "1rem", width: "320px" }}>
-      <h3>Чат ({username})</h3>
+    <div style={{ maxWidth: 500, margin: "0 auto", fontFamily: "sans-serif" }}>
+      <h2>🔐 Secure Chat</h2>
+      <div>
+        <b>User:</b> {username}
+      </div>
+      <div style={{ marginBottom: 5 }}>
+        <b>Status:</b>{" "}
+        <span style={{ color: connected ? "green" : "red" }}>
+          {connected ? "Ready" : "Disconnected"}
+        </span>
+      </div>
+
       <input
         type="text"
-        placeholder="Кому (username)"
+        placeholder="Receiver username"
         value={receiver}
         onChange={(e) => setReceiver(e.target.value)}
+        style={{
+          width: "100%",
+          margin: "10px 0",
+          padding: "6px",
+          borderRadius: "6px",
+          border: "1px solid #ccc",
+        }}
       />
-      <br />
-      <input
-        type="text"
-        placeholder="Сообщение"
-        value={message}
-        onChange={(e) => setMessage(e.target.value)}
-      />
-      <button onClick={sendMessage}>Отправить</button>
 
-      <ul style={{ marginTop: "1rem" }}>
-        {chat.map((msg, i) => (
-          <li key={i}>
-            <b>{msg.sender}:</b> {msg.message || msg.content}
-          </li>
-        ))}
-      </ul>
+      <div
+        ref={chatRef}
+        style={{
+          border: "1px solid #ccc",
+          height: 300,
+          overflowY: "auto",
+          padding: 8,
+          marginBottom: 10,
+          borderRadius: "6px",
+          background: "#f9f9f9",
+        }}
+      >
+        {messages.map((m, i) => {
+          const mine = m.from === username;
+          return (
+            <div
+              key={i}
+              style={{
+                display: "flex",
+                justifyContent: mine ? "flex-end" : "flex-start",
+                marginBottom: 8,
+              }}
+            >
+              <div
+                style={{
+                  background: mine ? "#DCF8C6" : "#E6F0FF",
+                  color: mine ? "black" : "#003399",
+                  borderRadius: "10px",
+                  padding: "6px 10px",
+                  maxWidth: "70%",
+                  textAlign: mine ? "right" : "left",
+                }}
+              >
+                {!mine && (
+                  <div
+                    style={{
+                      color: "#0074D9",
+                      fontWeight: "bold",
+                      marginBottom: 2,
+                    }}
+                  >
+                    {m.from}
+                  </div>
+                )}
+                {m.text}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ display: "flex", gap: "6px" }}>
+        <input
+          type="text"
+          placeholder="Message"
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+          style={{
+            flexGrow: 1,
+            padding: "6px",
+            borderRadius: "6px",
+            border: "1px solid #ccc",
+          }}
+        />
+        <button
+          onClick={sendMessage}
+          style={{
+            width: "90px",
+            background: "#007BFF",
+            color: "white",
+            border: "none",
+            borderRadius: "6px",
+            cursor: "pointer",
+          }}
+        >
+          Send
+        </button>
+      </div>
     </div>
   );
-};
-
-export default Chat;
+}

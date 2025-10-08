@@ -3,3 +3,4 @@ djangorestframework==3.14
 daphne==4.0.0
 channels==4.0.0
 cryptography==41.0.7
+pycryptodome

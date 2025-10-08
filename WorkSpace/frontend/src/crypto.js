@@ -1,74 +1,90 @@
-// Генерация пары ключей RSA
-export async function generateKeyPair() {
+// crypto.js – Diffie–Hellman + AES‑GCM + подпись
+
+// Генерация пары DH‑ключей (ECDH на Curve25519)
+export async function generateDHKeys() {
   const keyPair = await window.crypto.subtle.generateKey(
-    {
-      name: "RSASSA-PKCS1-v1_5",
-      modulusLength: 2048, // длина ключа
-      publicExponent: new Uint8Array([1, 0, 1]),
-      hash: "SHA-256",
-    },
-    true, // ключи извлекаемые (можем экспортировать)
+    { name: "X25519", namedCurve: "X25519" },
+    true,
+    ["deriveKey", "deriveBits"]
+  );
+  const publicKeyRaw = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  return {
+    public: new Uint8Array(publicKeyRaw),
+    private: keyPair.privateKey,
+  };
+}
+
+// Выработка общего секрета
+export async function computeShared(privateKey, peerPublicRaw) {
+  const peerKey = await crypto.subtle.importKey(
+    "raw",
+    peerPublicRaw,
+    { name: "X25519", namedCurve: "X25519" },
+    false,
+    []
+  );
+  const secret = await crypto.subtle.deriveBits(
+    { name: "X25519", public: peerKey },
+    privateKey,
+    256
+  );
+  return new Uint8Array(secret);
+}
+
+// Подпись сообщения
+export async function signMessage(message) {
+  const keyPair = await crypto.subtle.generateKey(
+    { name: "Ed25519" },
+    true,
     ["sign", "verify"]
   );
-
-  const publicKey = await window.crypto.subtle.exportKey("spki", keyPair.publicKey);
-  const privateKey = await window.crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
-
-  // в PEM формате (удобно хранить на сервере)
-  const publicKeyPem = convertToPem(publicKey, "PUBLIC KEY");
-  const privateKeyPem = convertToPem(privateKey, "PRIVATE KEY");
-
-  return { publicKey: publicKeyPem, privateKey: privateKeyPem };
-}
-
-// перевод ArrayBuffer -> PEM
-function convertToPem(buffer, label) {
-  const base64 = window.btoa(String.fromCharCode(...new Uint8Array(buffer)));
-  let pem = `-----BEGIN ${label}-----\n`;
-  for (let i = 0; i < base64.length; i += 64) {
-    pem += base64.slice(i, i + 64) + "\n";
-  }
-  pem += `-----END ${label}-----\n`;
-  return pem;
-}
-
-// ArrayBuffer -> hex
-function arrayBufferToHex(buffer) {
-  const byteArray = new Uint8Array(buffer);
-  return Array.from(byteArray)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-// Подпись сообщения приватным ключом
-export async function signMessage(privateKeyPem, message) {
-  // чистим PEM и превращаем в бинарный DER
-  const binaryDerString = window.atob(
-    privateKeyPem.replace(/-----.* PRIVATE KEY-----/g, "").replace(/\s+/g, "")
+  const signature = await crypto.subtle.sign(
+    { name: "Ed25519" },
+    keyPair.privateKey,
+    new TextEncoder().encode(message)
   );
-  const binaryDer = new Uint8Array(binaryDerString.length);
-  for (let i = 0; i < binaryDerString.length; i++) {
-    binaryDer[i] = binaryDerString.charCodeAt(i);
-  }
+  return btoa(String.fromCharCode(...new Uint8Array(signature)));
+}
 
-  // импорт приватного ключа
-  const privateKey = await window.crypto.subtle.importKey(
-    "pkcs8",
-    binaryDer.buffer,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+// AES‑GCM шифрование
+export async function encryptMessage(sharedSecret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    sharedSecret,
+    { name: "AES-GCM" },
     false,
-    ["sign"]
+    ["encrypt"]
   );
-
-  // подписываем само сообщение
-  const encoder = new TextEncoder();
-  const data = encoder.encode(message);
-  const signature = await window.crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    privateKey,
-    data
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encoded = new TextEncoder().encode(message);
+  const cipherBuf = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    encoded
   );
+  const cipher = new Uint8Array(cipherBuf);
+  const tag = cipher.slice(-16);
+  const ciphertext = cipher.slice(0, -16);
+  return {
+    nonce: btoa(String.fromCharCode(...iv)),
+    ciphertext: btoa(String.fromCharCode(...ciphertext)),
+    tag: btoa(String.fromCharCode(...tag)),
+  };
+}
 
-  // возвращаем hex-строку
-  return arrayBufferToHex(signature);
+// AES‑GCM дешифрование
+export async function decryptMessage(sharedSecret, nonceB64, ctB64, tagB64) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    sharedSecret,
+    { name: "AES-GCM" },
+    false,
+    ["decrypt"]
+  );
+  const iv = Uint8Array.from(atob(nonceB64), (c) => c.charCodeAt(0));
+  const ciphertext = Uint8Array.from(atob(ctB64), (c) => c.charCodeAt(0));
+  const tag = Uint8Array.from(atob(tagB64), (c) => c.charCodeAt(0));
+  const full = new Uint8Array([...ciphertext, ...tag]);
+  const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, full);
+  return new TextDecoder().decode(plainBuf);
 }
